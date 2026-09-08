@@ -41,10 +41,24 @@ function showStatus(msg, isError) {
   uploadStatus.classList.toggle("error", !!isError);
 }
 
+// An unhandled server error comes back as plain text, not JSON, so parsing the
+// body as JSON first threw away the only description of what went wrong and
+// left every failure looking like a bad file.
+async function readError(res) {
+  const text = await res.text();
+  try {
+    const detail = JSON.parse(text).detail;
+    if (detail) return detail;
+  } catch (_) {
+    /* not JSON - fall through to the raw text */
+  }
+  const snippet = text.trim().slice(0, 200);
+  return snippet ? `${snippet} (HTTP ${res.status})` : `Request failed (HTTP ${res.status})`;
+}
+
 async function handleUploadResponse(res) {
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || "Something went wrong reading that file.");
+    throw new Error(await readError(res));
   }
   return res.json();
 }
@@ -192,8 +206,7 @@ askForm.addEventListener("submit", async (e) => {
       body: JSON.stringify({ session_id: sessionId, question }),
     });
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.detail || "Couldn't process that question.");
+      throw new Error(await readError(res));
     }
     const data = await res.json();
     loadingEntry.innerHTML = `

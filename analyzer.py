@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from typing import Any, Dict
 
 import pandas as pd
@@ -9,6 +10,66 @@ from data_loader import COLUMN_KEYWORDS, detect_dataset_type, find_column, get_s
 from models import AnalysisResponse, BusinessMetrics, DatasetSummary
 from prompts import qa_prompt, recommendation_prompt, summary_prompt
 
+# A structured-output call can fail for two different reasons: the request was
+# rate-limited, or the model answered without a well-formed tool call. The Groq
+# client retries the first kind; nothing retries the second, and it is the one
+# that makes an endpoint fail intermittently for no visible reason.
+STRUCTURED_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 1.5
+
+
+def invoke_structured(chain, payload: Dict[str, Any]):
+    """Invoke a structured-output chain, retrying a malformed response."""
+    last_error: Exception | None = None
+    for attempt in range(STRUCTURED_ATTEMPTS):
+        try:
+            return chain.invoke(payload)
+        except Exception as exc:  # noqa: BLE001 - retry any transient failure
+            last_error = exc
+            if attempt < STRUCTURED_ATTEMPTS - 1:
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+    raise last_error
+
+
+def summarize_without_llm(df: pd.DataFrame) -> DatasetSummary:
+    """Build a dataset summary from Pandas alone.
+
+    Every figure on the dashboard except this summary is calculated locally, so a
+    model that is rate-limited or answering without a well-formed tool call should
+    cost the user their AI commentary - not their dataset.
+    """
+    stats = get_statistics(df)
+    columns = ", ".join(str(c) for c in df.columns)
+
+    notes = []
+    missing = {k: v for k, v in stats["missing_values"].items() if v}
+    if missing:
+        notes.append(
+            "Missing values: " + ", ".join(f"{k} ({v})" for k, v in missing.items()) + "."
+        )
+    else:
+        notes.append("No missing values detected in any column.")
+    if stats["duplicate_rows"]:
+        notes.append(f"{stats['duplicate_rows']} duplicate rows found.")
+    else:
+        notes.append("No duplicate rows found.")
+    notes.append("AI commentary is unavailable right now, so these notes are from the data itself.")
+
+    return DatasetSummary(
+        dataset_type=detect_dataset_type(df),
+        summary=(
+            f"{stats['row_count']} rows across {stats['column_count']} columns: {columns}. "
+            "Metrics, preview and statistics below are calculated directly from your data."
+        ),
+        data_quality_notes=notes,
+        suggested_questions=[
+            "What is the total revenue?",
+            "Which region performs best?",
+            "What are the top products?",
+            "Give me recommendations based on this data.",
+        ],
+    )
+
 
 def generate_initial_insights(df: pd.DataFrame, metrics: BusinessMetrics, llm=None) -> DatasetSummary:
     """Summarize the dataset, flag data quality issues, and suggest questions to ask."""
@@ -17,7 +78,8 @@ def generate_initial_insights(df: pd.DataFrame, metrics: BusinessMetrics, llm=No
     chain = summary_prompt | structured_llm
 
     stats = get_statistics(df)
-    result: DatasetSummary = chain.invoke(
+    result: DatasetSummary = invoke_structured(
+        chain,
         {
             "dataset_type": detect_dataset_type(df),
             "columns": ", ".join(str(c) for c in df.columns),
@@ -26,7 +88,7 @@ def generate_initial_insights(df: pd.DataFrame, metrics: BusinessMetrics, llm=No
             "duplicate_rows": stats["duplicate_rows"],
             "sample_rows": df.head(5).to_json(orient="records"),
             "metrics": metrics.model_dump_json(indent=2),
-        }
+        },
     )
     return result
 
@@ -121,16 +183,18 @@ def explain_result(
 
     if intent["type"] == "recommendation":
         chain = recommendation_prompt | structured_llm
-        return chain.invoke(
+        return invoke_structured(
+            chain,
             {
                 "question": question,
                 "dataset_summary": dataset_summary.summary,
                 "metrics": metrics.model_dump_json(indent=2),
-            }
+            },
         )
 
     chain = qa_prompt | structured_llm
-    return chain.invoke(
+    return invoke_structured(
+        chain,
         {
             "question": question,
             "analysis_type": intent["type"],

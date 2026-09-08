@@ -8,7 +8,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from analyzer import detect_intent, execute_analysis, explain_result, generate_initial_insights
+from analyzer import (
+    detect_intent,
+    execute_analysis,
+    explain_result,
+    generate_initial_insights,
+    summarize_without_llm,
+)
 from config import APP_TITLE, UPLOAD_DIR, get_llm
 from data_loader import (
     calculate_business_metrics,
@@ -30,6 +36,19 @@ app.add_middleware(
 
 # In-memory session store: {session_id: {"df": ..., "metrics": ..., "summary": ...}}
 SESSIONS: Dict[str, dict] = {}
+
+# Resolved against this file, not the working directory, so the sample still
+# loads whatever directory the server is started from.
+SAMPLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filtered_sales.csv")
+
+
+def summarize(df, metrics) -> tuple:
+    """Return (summary, ai_available). Falls back to a Pandas-only summary."""
+    try:
+        return generate_initial_insights(df, metrics, llm=get_llm()), True
+    except Exception as exc:  # noqa: BLE001 - the dashboard works without the model
+        print(f"WARNING: initial insights unavailable, using local summary: {exc!r}")
+        return summarize_without_llm(df), False
 
 
 class AskRequest(BaseModel):
@@ -65,9 +84,8 @@ async def upload(file: UploadFile = File(...)) -> dict:
     with open(save_path, "wb") as f:
         f.write(file_bytes)
 
-    llm = get_llm()
     metrics = calculate_business_metrics(df)
-    dataset_summary = generate_initial_insights(df, metrics, llm=llm)
+    dataset_summary, ai_available = summarize(df, metrics)
     stats = get_statistics(df)
 
     session_id = str(uuid.uuid4())
@@ -79,6 +97,7 @@ async def upload(file: UploadFile = File(...)) -> dict:
 
     return {
         "session_id": session_id,
+        "ai_available": ai_available,
         "dataset_type": dataset_summary.dataset_type,
         "summary": dataset_summary.summary,
         "data_quality_notes": dataset_summary.data_quality_notes,
@@ -99,16 +118,17 @@ async def upload(file: UploadFile = File(...)) -> dict:
 
 @app.post("/api/sample")
 def load_sample() -> dict:
-    file_name = "filtered_sales.csv"
-    if not os.path.exists(file_name):
+    if not os.path.exists(SAMPLE_FILE):
         raise HTTPException(status_code=404, detail="Sample dataset not found on server.")
-    with open(file_name, "rb") as f:
+    with open(SAMPLE_FILE, "rb") as f:
         file_bytes = f.read()
 
-    df = load_dataset(file_bytes, file_name)
-    llm = get_llm()
+    try:
+        df = load_dataset(file_bytes, os.path.basename(SAMPLE_FILE))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Could not read the sample dataset: {exc}") from exc
     metrics = calculate_business_metrics(df)
-    dataset_summary = generate_initial_insights(df, metrics, llm=llm)
+    dataset_summary, ai_available = summarize(df, metrics)
     stats = get_statistics(df)
 
     session_id = str(uuid.uuid4())
@@ -120,6 +140,7 @@ def load_sample() -> dict:
 
     return {
         "session_id": session_id,
+        "ai_available": ai_available,
         "dataset_type": dataset_summary.dataset_type,
         "summary": dataset_summary.summary,
         "data_quality_notes": dataset_summary.data_quality_notes,
@@ -148,10 +169,17 @@ def ask(req: AskRequest) -> dict:
     metrics = session["metrics"]
     dataset_summary = session["summary"]
 
-    llm = get_llm()
     intent = detect_intent(req.question, df)
     result = execute_analysis(df, intent, metrics)
-    response = explain_result(req.question, intent, result, dataset_summary, metrics, llm=llm)
+    try:
+        response = explain_result(
+            req.question, intent, result, dataset_summary, metrics, llm=get_llm()
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail=f"The model could not answer that just now ({type(exc).__name__}). Please try again.",
+        ) from exc
 
     return {
         "question": req.question,
