@@ -7,7 +7,11 @@ load_dotenv()
 
 APP_TITLE = "AI Business Intelligence Agent"
 UPLOAD_DIR = "uploads"
-MODEL_NAME = "openai/gpt-oss-120b"
+# Reverted from "openai/gpt-oss-120b". That model is the last functional change
+# this repo saw (c433f81, 29 Aug) and the endpoint has been failing ~8 calls in
+# 10 since: it answers without the well-formed tool call that
+# with_structured_output(method="function_calling") requires.
+MODEL_NAME = "llama-3.3-70b-versatile"
 TEMPERATURE = 0
 # Groq's free tier rate-limits per minute; let the client ride out a 429
 # rather than surfacing it as a failed request.
